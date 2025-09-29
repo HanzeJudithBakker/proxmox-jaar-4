@@ -1,0 +1,7 @@
+nano /etc/apt/sources.list
+deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription
+
+nano /etc/apt/sources.list.d/pve-enterprise.list
+nano /etc/apt/sources.list.d/ceph.list
+voor de laaste twee moet een # 
+
