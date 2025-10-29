@@ -1,14 +1,11 @@
 #!/bin/bash
-# Script: create-wp1.sh (aangepast voor jouw omgeving)
-# Doel: 1 LXC container maken in Proxmox 8 met WordPress (Apache + PHP + MariaDB)
-# Netwerk: 10.24.40.100/24 met gateway 10.24.40.1
-# Firewall: alleen SSH/HTTP/HTTPS, + Node Exporter (9100) enkel vanaf 10.24.40.51
+# create-wp1-fixed.sh — WP LXC met robuuste DB-setup (Proxmox 8)
 
 set -euo pipefail
 
-CTID=210
-HOSTNAME=wp0
-IP="10.24.40.100/24"
+CTID=210 #elke keer aanpassen
+HOSTNAME=wp0 #elke keer aanpassen 
+IP="10.24.40.100/24" #elke keer aanpassen
 GW=10.24.40.1
 BRIDGE=vmbr0
 TEMPLATE=local:vztmpl/debian-12-standard_12.1-1_amd64.tar.zst
@@ -16,8 +13,13 @@ STORAGE=local-lvm
 PASSWORD="KUTwachtwoord1239"
 MONITOR_IP="10.24.40.51"
 
-echo ">> Container $CTID ($HOSTNAME) wordt aangemaakt..."
+# F I X: vaste DB-gegevens (werkt altijd, makkelijk te reproduceren)
+DB_NAME="wpdb"
+DB_USER="wpuser"
+DB_PASS="WpFix123!"         # mag je later wijzigen; WP-config wordt meegepatcht
+DB_HOST="127.0.0.1"         # F I X: forceer TCP
 
+echo ">> Container $CTID ($HOSTNAME) wordt aangemaakt…"
 pct create "$CTID" "$TEMPLATE" \
   -hostname "$HOSTNAME" \
   -cores 2 -memory 1024 \
@@ -30,18 +32,16 @@ pct create "$CTID" "$TEMPLATE" \
 
 pct start "$CTID"
 
-echo ">> Configureer OS + WordPress in $HOSTNAME..."
-
+echo ">> OS + WordPress configureren…"
 pct exec "$CTID" -- bash -euxc "
   export DEBIAN_FRONTEND=noninteractive
   apt update
   apt -y upgrade
   apt -y install sudo ca-certificates curl wget unzip \
                  apache2 mariadb-server php php-mysql php-zip php-xml php-curl php-mbstring php-gd libapache2-mod-php
-
   systemctl enable --now apache2 mariadb
 
-  # Gebruikers met wachtwoord
+  # Users met wachtwoord (tijdelijk; later kun je naar SSH-keys)
   adduser --gecos '' --disabled-password trainer1
   adduser --gecos '' --disabled-password trainer2
   echo 'trainer1:${PASSWORD}' | chpasswd
@@ -49,38 +49,44 @@ pct exec "$CTID" -- bash -euxc "
   usermod -aG sudo trainer1
   usermod -aG sudo trainer2
 
-  # SSH wachtwoord-login toestaan (tijdelijk)
+  # SSH wachtwoordlogin tijdelijk aan
   sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
   sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
   systemctl restart ssh
 
-  # Database voor WordPress
-  DB=wordpress
-  DBUSER=wpuser
-  DBPASS=wp!$(openssl rand -hex 6)
-  mysql -uroot -e \"
-    CREATE DATABASE IF NOT EXISTS \\\$DB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-    CREATE USER IF NOT EXISTS '\\\$DBUSER'@'localhost' IDENTIFIED BY '\\\$DBPASS';
-    GRANT ALL PRIVILEGES ON \\\$DB.* TO '\\\$DBUSER'@'localhost';
-    FLUSH PRIVILEGES;\"
-  printf 'DB_NAME=%s\nDB_USER=%s\nDB_PASS=%s\n' \"\$DB\" \"\$DBUSER\" \"\$DBPASS\" > /root/wp-db.env
+  # --- F I X --- Robuuste MariaDB + WordPress DB-setup
+  # 1) zorg dat MariaDB lokaal luistert en draait
+  sed -i 's/^bind-address.*/bind-address = 127.0.0.1/' /etc/mysql/mariadb.conf.d/50-server.cnf || echo 'bind-address = 127.0.0.1' >> /etc/mysql/mariadb.conf.d/50-server.cnf
+  systemctl restart mariadb
 
-  # WordPress installeren (Apache DocumentRoot)
+  # 2) maak DB en user via UNIX socket (geen root-wachtwoord nodig)
+  mysql -uroot --protocol=socket <<SQL
+CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
+ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';
+FLUSH PRIVILEGES;
+SQL
+
+  # 3) WordPress installeren en wp-config patchen met vaste DB-waarden + DB_HOST=127.0.0.1
   wget -q https://wordpress.org/latest.zip -O /tmp/wordpress.zip
   unzip -q /tmp/wordpress.zip -d /tmp/
   rm -rf /var/www/html/*
   mv /tmp/wordpress/* /var/www/html/
   cp /var/www/html/wp-config-sample.php /var/www/html/wp-config.php
   sed -i \"
-    s/database_name_here/\$DB/;
-    s/username_here/\$DBUSER/;
-    s/password_here/\$DBPASS/;
+    s/define( *'DB_NAME'.*/define('DB_NAME', '${DB_NAME}');/;
+    s/define( *'DB_USER'.*/define('DB_USER', '${DB_USER}');/;
+    s/define( *'DB_PASSWORD'.*/define('DB_PASSWORD', '${DB_PASS}');/;
   \" /var/www/html/wp-config.php
+  grep -q \"define('DB_HOST'\" /var/www/html/wp-config.php \
+    && sed -i \"s/define( *'DB_HOST'.*/define('DB_HOST', '${DB_HOST}');/\" /var/www/html/wp-config.php \
+    || echo \"define('DB_HOST','${DB_HOST}');\" >> /var/www/html/wp-config.php
   chown -R www-data:www-data /var/www/html
   a2enmod php* rewrite
   systemctl restart apache2
 
-  # Node Exporter (vastgezette versie)
+  # Node Exporter (monitoring)
   useradd --no-create-home --system --shell /usr/sbin/nologin nodeexp || true
   VER='v1.8.1'
   curl -fsSL -o /tmp/ne.tar.gz https://github.com/prometheus/node_exporter/releases/download/\$VER/node_exporter-1.8.1.linux-amd64.tar.gz
@@ -100,24 +106,24 @@ SVC
   systemctl enable --now node_exporter
 "
 
-echo ">> Firewall instellen (Proxmox container-firewall)..."
+echo ">> Proxmox container-firewall configureren…"
 cat >/etc/pve/firewall/$CTID.fw <<EOF
 [OPTIONS]
 enable: 1
 policy_in: drop
 policy_out: accept
-
 [RULES]
-# SSH
 IN ACCEPT -p tcp --dport 22
-# HTTP/S
 IN ACCEPT -p tcp --dport 80
 IN ACCEPT -p tcp --dport 443
-# Node Exporter alleen vanaf monitoring
 IN ACCEPT -s ${MONITOR_IP}/32 -p tcp --dport 9100
 EOF
 
-echo ">> Container $CTID ($HOSTNAME) klaar!"
-echo "   HTTP:  http://10.24.40.100"
-echo "   SSH :  trainer1 / trainer2  (wachtwoord: ${PASSWORD})"
-echo "   Note:  later kun je PasswordAuthentication uitzetten en SSH-keys toevoegen."
+# Kleine health checks
+echo ">> Health checks:"
+pct exec "$CTID" -- bash -lc "mysql -h${DB_HOST} -u${DB_USER} -p'${DB_PASS}' -e 'SHOW DATABASES;' >/dev/null && echo '  - DB connect: OK'"
+pct exec "$CTID" -- bash -lc "curl -I -s http://127.0.0.1 | head -n1"
+
+echo ">> Klaar! Open http://10.24.40.100 (WP-setup)."
+echo "   DB: name=${DB_NAME} user=${DB_USER} pass=${DB_PASS} host=${DB_HOST}"
+echo "   SSH: trainer1 / trainer2 (wachtwoord: ${PASSWORD})"
