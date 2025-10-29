@@ -1,0 +1,4 @@
+pct enter 201
+systemctl restart prometheus
+systemctl status prometheus --no-pager
+ss -lntp | grep 9090
