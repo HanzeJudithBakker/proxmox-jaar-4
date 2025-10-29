@@ -60,13 +60,13 @@ pct exec "$CTID" -- bash -euxc "
   systemctl restart mariadb
 
   # 2) maak DB en user via UNIX socket (geen root-wachtwoord nodig)
-  mysql -uroot --protocol=socket <<SQL
-CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+  mysql -uroot --protocol=socket <<EOF
+CREATE DATABASE IF NOT EXISTS ${DB_NAME} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
 ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
-GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';
+GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'localhost';
 FLUSH PRIVILEGES;
-SQL
+EOF
 
   # 3) WordPress installeren en wp-config patchen met vaste DB-waarden + DB_HOST=127.0.0.1
   wget -q https://wordpress.org/latest.zip -O /tmp/wordpress.zip
