@@ -1,166 +1,66 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+set -e
 
-# ===================== AANPASBARE VARIABELEN =====================
-TEMPLATE_ID=301             # jouw golden image/template
-NEW_ID=302                  # nieuw VMID voor extra VM
-NEW_NAME="twentycrm-2"      # naam van de nieuwe VM
-NODE="host1"                # we houden alles op host1
+# ===================== CONFIG =====================
+TEMPLATE=301
+VMID=303
+NAME="twentycrm-2"
+NODE="host2"
+STORAGE="vmdata"             # Ceph storage (gedeeld)
+IP="10.24.40.54"
+GW="10.24.40.1"
+MASK="/24"
 BRIDGE="vmbr0"
 VLAN=2440
 CORES=2
-RAM_MB=2048
-DISK_GB=50                  # extra diskruimte (als je wil resizen)
-SSH_USER="judith"           # user binnen de VM
-SSH_KEY="$HOME/.ssh/id_rsa" # private key waarmee je op de VM inlogt
-# =================================================================
+RAM=4096
+SSH_PRIV="/root/.ssh/id_ed25519"
+SSH_PUB="/root/.ssh/id_ed25519.pub"
+# ==================================================
 
-need_tools() {
-  command -v qm >/dev/null || { echo "Run me on a Proxmox node (qm not found)"; exit 1; }
-  if ! command -v jq >/dev/null; then
-    echo "jq ontbreekt, installeren..."
-    apt update && apt install -y jq >/dev/null
-  fi
-}
+echo "[INFO] Oude VM verwijderen (indien aanwezig)..."
+qm stop "$VMID" --skiplock 1 2>/dev/null || true
+qm destroy "$VMID" --purge 2>/dev/null || true
 
-clone_vm() {
-  echo "==> Clone template ${TEMPLATE_ID} -> ${NEW_ID} (${NEW_NAME}) op ${NODE}"
-  qm clone "${TEMPLATE_ID}" "${NEW_ID}" --name "${NEW_NAME}" --full 1 --target "${NODE}"
+echo "[INFO] Nieuwe VM clonen vanaf template ${TEMPLATE} naar ${NODE}..."
+qm clone "$TEMPLATE" "$VMID" --name "$NAME" --full 1 --target "$NODE" --storage "$STORAGE"
 
-  # hardware/net/guest-agent
-  qm set "${NEW_ID}" --cores "${CORES}" --memory "${RAM_MB}"
-  qm set "${NEW_ID}" --net0 virtio,bridge="${BRIDGE}",tag="${VLAN}"
-  qm set "${NEW_ID}" --scsihw virtio-scsi-pci
-  qm set "${NEW_ID}" --serial0 socket --agent enabled=1
+echo "[INFO] CPU, geheugen en netwerk configureren..."
+qm set "$VMID" --cores "$CORES" --memory "$RAM"
+qm set "$VMID" --net0 virtio,bridge="$BRIDGE",tag="$VLAN"
+qm set "$VMID" --ipconfig0 ip=${IP}${MASK},gw=${GW}
+qm set "$VMID" --nameserver 1.1.1.1
+qm set "$VMID" --sshkey "$SSH_PUB"
+qm set "$VMID" --agent enabled=1
 
-  # (optioneel) disk vergroten
-  if [[ "${DISK_GB}" -gt 0 ]]; then
-    qm resize "${NEW_ID}" scsi0 +"${DISK_GB}"G || true
-  fi
+echo "[INFO] VM ${VMID} starten..."
+qm start "$VMID"
 
-  qm start "${NEW_ID}"
-}
+echo "[INFO] 15 seconden wachten tot de VM online is..."
+sleep 15
 
-wait_for_ip() {
-  echo "==> Wachten op IP van VM ${NEW_ID} (guest-agent moet actief zijn)..."
-  for i in {1..60}; do
-    out="$(qm guest cmd "${NEW_ID}" network-get-interfaces 2>/dev/null || true)"
-    ip="$(echo "${out}" | jq -r '.[]?."ip-addresses"[]?."ip-address"?' \
-          | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' \
-          | grep -v '^127\.' | head -n1 || true)"
-    if [[ -n "${ip}" ]]; then
-      echo "==> IP gevonden: ${ip}"
-      echo "${ip}"
-      return 0
-    fi
-    sleep 5
-  done
-  echo "!! Geen IP ontvangen. Check of qemu-guest-agent in de VM draait en netwerk/VLAN klopt."
-  exit 1
-}
-
-bootstrap_remote() {
-  local ip="$1"
-  echo "==> Provisioning op ${ip} (Docker, Twenty, UFW, Nginx/HTTPS)..."
-
-  ssh -o StrictHostKeyChecking=no -i "${SSH_KEY}" "${SSH_USER}@${ip}" bash -s <<'REMOTE_EOF'
-set -euo pipefail
-
-# ---- basis & firewall & nginx ----
+# -------- Provisioning binnen de VM --------
+echo "[INFO] Docker + Twenty installeren op ${IP}..."
+ssh -o StrictHostKeyChecking=no -i "$SSH_PRIV" judith@${IP} bash -s <<'VM'
+set -e
 sudo apt update
-sudo apt -y full-upgrade
-sudo apt install -y ufw curl ca-certificates gnupg lsb-release nginx
+sudo apt install -y curl docker.io docker-compose ufw nginx
 
-# UFW: alleen 22/80/443 open
-sudo ufw default deny incoming || true
-sudo ufw default allow outgoing || true
-sudo ufw allow 22/tcp
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-echo "y" | sudo ufw enable || true
-
-# ---- Docker engine + compose plugin ----
-sudo install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \$(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 sudo systemctl enable --now docker
 
-# ---- Twenty: officieel installer-script ----
-if [[ ! -d "\$HOME/twenty" ]]; then
-  bash <(curl -sL https://raw.githubusercontent.com/twentyhq/twenty/main/packages/twenty-docker/scripts/install.sh)
-fi
+# Firewall
+sudo ufw allow OpenSSH
+sudo ufw allow 80
+sudo ufw allow 443
+echo "y" | sudo ufw enable || true
 
-IP=\$(hostname -I | awk '{print \$1}')
+# Twenty CRM
+mkdir -p ~/twenty
+cd ~/twenty
+bash <(curl -sL https://raw.githubusercontent.com/twentyhq/twenty/main/packages/twenty-docker/scripts/install.sh)
 
-# SERVER_URL op https://<IP> zetten
-sed -i "s|^SERVER_URL=.*|SERVER_URL=https://\${IP}|" \$HOME/twenty/.env
-
-# Zorg dat DB/REDIS variabelen aanwezig zijn (niet gecommentarieerd)
-grep -q '^PG_DATABASE_HOST=' \$HOME/twenty/.env || {
-  cat >> \$HOME/twenty/.env <<EOT
-
-PG_DATABASE_USER=postgres
-PG_DATABASE_HOST=db
-PG_DATABASE_PORT=5432
-REDIS_URL=redis://redis:6379
-EOT
-}
-
-# containers herstarten met nieuwe URL
-cd \$HOME/twenty
-docker compose down
+echo "[INFO] Containers starten..."
 docker compose up -d
 
-# ---- Self-signed TLS ----
-sudo openssl req -x509 -nodes -days 825 -newkey rsa:2048 \
-  -keyout /etc/ssl/private/twenty.key \
-  -out /etc/ssl/certs/twenty.crt \
-  -subj "/CN=\${IP}"
-sudo chmod 600 /etc/ssl/private/twenty.key
-
-# ---- Nginx reverse proxy (HTTP->HTTPS + proxy naar :3000) ----
-sudo tee /etc/nginx/sites-available/twenty >/dev/null <<NGX
-server {
-  listen 80;
-  server_name \${IP};
-  return 301 https://\$host\$request_uri;
-}
-server {
-  listen 443 ssl;
-  server_name \${IP};
-
-  ssl_certificate     /etc/ssl/certs/twenty.crt;
-  ssl_certificate_key /etc/ssl/private/twenty.key;
-  ssl_protocols TLSv1.2 TLSv1.3;
-  ssl_ciphers HIGH:!aNULL:!MD5;
-
-  location / {
-    proxy_pass http://127.0.0.1:3000;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection "upgrade";
-  }
-}
-NGX
-sudo ln -sf /etc/nginx/sites-available/twenty /etc/nginx/sites-enabled/twenty
-sudo nginx -t && sudo systemctl reload nginx
-
-echo "OK: bezoek https://\${IP} (self-signed waarschuwing is normaal)"
-REMOTE_EOF
-}
-
-# ---------------- MAIN ----------------
-need_tools
-clone_vm
-VM_IP="$(wait_for_ip)"
-bootstrap_remote "${VM_IP}"
-
-echo
-echo "KLAAR ✅  Nieuwe VM: ${NEW_NAME} (${NEW_ID}) op IP: ${VM_IP}"
-echo "Open in je browser: https://${VM_IP}  (accepteer 1x de self-signed waarschuwing)"
+echo "[DONE] Twenty draait nu op https://$(hostname -I | awk '{print $1}'):3000"
+VM
