@@ -1,0 +1,123 @@
+#!/bin/bash
+# Script: create-wp1.sh (aangepast voor jouw omgeving)
+# Doel: 1 LXC container maken in Proxmox 8 met WordPress (Apache + PHP + MariaDB)
+# Netwerk: 10.24.40.100/24 met gateway 10.24.40.1
+# Firewall: alleen SSH/HTTP/HTTPS, + Node Exporter (9100) enkel vanaf 10.24.40.51
+
+set -euo pipefail
+
+CTID=210
+HOSTNAME=wp0
+IP="10.24.40.100/24"
+GW=10.24.40.1
+BRIDGE=vmbr0
+TEMPLATE=local:vztmpl/debian-12-standard_12.1-1_amd64.tar.zst
+STORAGE=local-lvm
+PASSWORD="KUTwachtwoord1239"
+MONITOR_IP="10.24.40.51"
+
+echo ">> Container $CTID ($HOSTNAME) wordt aangemaakt..."
+
+pct create "$CTID" "$TEMPLATE" \
+  -hostname "$HOSTNAME" \
+  -cores 2 -memory 1024 \
+  -net0 "name=eth0,bridge=$BRIDGE,ip=$IP,gw=$GW,firewall=1" \
+  -storage "$STORAGE" \
+  -rootfs "${STORAGE}:30" \
+  -onboot 1 \
+  -unprivileged 1 \
+  -password "$PASSWORD"
+
+pct start "$CTID"
+
+echo ">> Configureer OS + WordPress in $HOSTNAME..."
+
+pct exec "$CTID" -- bash -euxc "
+  export DEBIAN_FRONTEND=noninteractive
+  apt update
+  apt -y upgrade
+  apt -y install sudo ca-certificates curl wget unzip \
+                 apache2 mariadb-server php php-mysql php-zip php-xml php-curl php-mbstring php-gd libapache2-mod-php
+
+  systemctl enable --now apache2 mariadb
+
+  # Gebruikers met wachtwoord
+  adduser --gecos '' --disabled-password trainer1
+  adduser --gecos '' --disabled-password trainer2
+  echo 'trainer1:${PASSWORD}' | chpasswd
+  echo 'trainer2:${PASSWORD}' | chpasswd
+  usermod -aG sudo trainer1
+  usermod -aG sudo trainer2
+
+  # SSH wachtwoord-login toestaan (tijdelijk)
+  sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+  sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+  systemctl restart ssh
+
+  # Database voor WordPress
+  DB=wordpress
+  DBUSER=wpuser
+  DBPASS=wp!$(openssl rand -hex 6)
+  mysql -uroot -e \"
+    CREATE DATABASE IF NOT EXISTS \\\$DB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    CREATE USER IF NOT EXISTS '\\\$DBUSER'@'localhost' IDENTIFIED BY '\\\$DBPASS';
+    GRANT ALL PRIVILEGES ON \\\$DB.* TO '\\\$DBUSER'@'localhost';
+    FLUSH PRIVILEGES;\"
+  printf 'DB_NAME=%s\nDB_USER=%s\nDB_PASS=%s\n' \"\$DB\" \"\$DBUSER\" \"\$DBPASS\" > /root/wp-db.env
+
+  # WordPress installeren (Apache DocumentRoot)
+  wget -q https://wordpress.org/latest.zip -O /tmp/wordpress.zip
+  unzip -q /tmp/wordpress.zip -d /tmp/
+  rm -rf /var/www/html/*
+  mv /tmp/wordpress/* /var/www/html/
+  cp /var/www/html/wp-config-sample.php /var/www/html/wp-config.php
+  sed -i \"
+    s/database_name_here/\$DB/;
+    s/username_here/\$DBUSER/;
+    s/password_here/\$DBPASS/;
+  \" /var/www/html/wp-config.php
+  chown -R www-data:www-data /var/www/html
+  a2enmod php* rewrite
+  systemctl restart apache2
+
+  # Node Exporter (vastgezette versie)
+  useradd --no-create-home --system --shell /usr/sbin/nologin nodeexp || true
+  VER='v1.8.1'
+  curl -fsSL -o /tmp/ne.tar.gz https://github.com/prometheus/node_exporter/releases/download/\$VER/node_exporter-1.8.1.linux-amd64.tar.gz
+  tar -xzf /tmp/ne.tar.gz -C /tmp
+  install -m 0755 /tmp/node_exporter-*/node_exporter /usr/local/bin/node_exporter
+  cat > /etc/systemd/system/node_exporter.service <<SVC
+[Unit]
+Description=Prometheus Node Exporter
+After=network.target
+[Service]
+User=nodeexp
+ExecStart=/usr/local/bin/node_exporter
+[Install]
+WantedBy=multi-user.target
+SVC
+  systemctl daemon-reload
+  systemctl enable --now node_exporter
+"
+
+echo ">> Firewall instellen (Proxmox container-firewall)..."
+cat >/etc/pve/firewall/$CTID.fw <<EOF
+[OPTIONS]
+enable: 1
+policy_in: drop
+policy_out: accept
+
+[RULES]
+# SSH
+IN ACCEPT -p tcp --dport 22
+# HTTP/S
+IN ACCEPT -p tcp --dport 80
+IN ACCEPT -p tcp --dport 443
+# Node Exporter alleen vanaf monitoring
+IN ACCEPT -s ${MONITOR_IP}/32 -p tcp --dport 9100
+EOF
+
+echo ">> Container $CTID ($HOSTNAME) klaar!"
+echo "   HTTP:  http://10.24.40.100"
+echo "   SSH :  trainer1 / trainer2  (wachtwoord: ${PASSWORD})"
+echo "   Note:  later kun je PasswordAuthentication uitzetten en SSH-keys toevoegen."
