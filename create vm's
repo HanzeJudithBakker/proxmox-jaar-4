@@ -1,0 +1,30 @@
+#!/bin/bash
+# Proxmox VM deploy script – TwentyCRM omgeving
+
+ISO="local:iso/debian-13.1.0-amd64-netinst.iso"
+STORAGE="vmdata"          # <-- jouw Ceph pool
+BRIDGE="vmbr0"
+
+# VM configuraties
+declare -A VMS=(
+  [301]="twentycrm1"
+  [302]="twentycrm2"
+  [303]="twentycrm3"
+)
+
+for VMID in "${!VMS[@]}"; do
+  NAME=${VMS[$VMID]}
+  echo "➡️  Maak VM $NAME ($VMID) aan..."
+
+  qm create $VMID --name $NAME --memory 2048 --cores 2 --net0 virtio,bridge=$BRIDGE,tag=2440
+  qm set $VMID --scsi0 ${STORAGE}:50,format=qcow2
+  qm set $VMID --ide2 $ISO,media=cdrom
+  qm set $VMID --boot c --bootdisk scsi0
+  qm set $VMID --serial0 socket --vga serial0
+  qm set $VMID --agent enabled=1
+
+  echo "✅  VM $NAME ($VMID) is aangemaakt op $STORAGE met ISO $ISO"
+  echo "-----------------------------------------------------------"
+done
+
+echo "🎉 Alle drie TwentyCRM VM's zijn succesvol aangemaakt!"
