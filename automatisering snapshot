@@ -1,0 +1,10 @@
+#!/bin/bash
+# Script: auto-snapshot.sh
+# Doel: maakt dagelijks snapshots van CRM-VM's
+
+for vmid in 301 302 303; do
+  echo "Snapshot maken van VM $vmid..."
+  qm snapshot $vmid "auto-$(date +%F)" --description "Dagelijkse snapshot van $vmid"
+done
+
+echo "Klaar om $(date)"
