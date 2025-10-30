@@ -14,3 +14,8 @@ IN ACCEPT -p tcp --dport 9100 -source 10.24.40.51/32
 
 
 aanpassen in script
+
+apt update
+apt install -y prometheus-node-exporter
+systemctl enable --now prometheus-node-exporter
+ voor prometheus 
